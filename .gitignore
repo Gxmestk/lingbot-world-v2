@@ -9,3 +9,6 @@ logs/
 *.json
 *.pth
 *.zip
+.venv/
+lingbot-world-v2-1.3b-causal-fast/
+lingbot-world-v2-14b-causal-fast/
