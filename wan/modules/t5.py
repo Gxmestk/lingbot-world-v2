@@ -491,7 +491,11 @@ class T5EncoderModel:
             dtype=dtype,
             device=device).eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        # mmap keeps the 11.36 GB bf16 state dict file-backed instead of
+        # anonymous RAM; without it the load peaks ~24 GB beside the model
+        # and dies on boxes without swap.
+        model.load_state_dict(torch.load(
+            checkpoint_path, map_location='cpu', mmap=True))
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)

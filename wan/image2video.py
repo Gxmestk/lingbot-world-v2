@@ -69,8 +69,12 @@ def _resolve_dit_dir(checkpoint_dir, subfolder):
     return checkpoint_dir
 
 
-def _load_safetensors_state_dict(dit_dir):
-    """Load a (possibly sharded) safetensors dump from ``dit_dir``."""
+def _iter_safetensors_shards(dit_dir):
+    """Yield (name, state_dict) for each safetensors shard in ``dit_dir``.
+
+    One shard at a time so the caller's peak RAM stays bounded by the
+    largest shard instead of the merged dump.
+    """
     from safetensors.torch import load_file
 
     for index_name in (
@@ -82,10 +86,9 @@ def _load_safetensors_state_dict(dit_dir):
             continue
         with open(index_path) as f:
             index = json.load(f)
-        state = {}
         for shard in sorted(set(index["weight_map"].values())):
-            state.update(load_file(os.path.join(dit_dir, shard)))
-        return state
+            yield shard, load_file(os.path.join(dit_dir, shard))
+        return
 
     for single_name in (
             "model.safetensors",
@@ -93,7 +96,8 @@ def _load_safetensors_state_dict(dit_dir):
     ):
         single_path = os.path.join(dit_dir, single_name)
         if os.path.isfile(single_path):
-            return load_file(single_path)
+            yield single_name, load_file(single_path)
+            return
 
     raise FileNotFoundError(
         f"No safetensors weights found in {dit_dir}. Expected a sharded "
@@ -142,13 +146,27 @@ def load_dit_model(model_cls, checkpoint_dir, subfolder, config, torch_dtype,
         f"config.json not found in {dit_dir}; building {model_cls.__name__} "
         "from the task config and loading safetensors weights."
     )
-    model = model_cls(**_dit_kwargs_from_config(config, extra))
-    state = _load_safetensors_state_dict(dit_dir)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Build directly in the target dtype (instead of fp32 + .to()) and load
+    # one shard at a time: peak RAM is the bf16 model + the largest shard,
+    # not model + the full merged dump.
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch_dtype)
+        model = model_cls(**_dit_kwargs_from_config(config, extra))
+    finally:
+        torch.set_default_dtype(old_dtype)
+    missing, unexpected = None, set()
+    for _shard, shard_state in _iter_safetensors_shards(dit_dir):
+        shard_missing, shard_unexpected = model.load_state_dict(
+            shard_state, strict=False)
+        missing = (set(shard_missing) if missing is None
+                   else missing & set(shard_missing))
+        unexpected |= set(shard_unexpected)
     if missing:
-        logging.warning(f"Missing keys when loading DiT: {missing}")
+        logging.warning(f"Missing keys when loading DiT: {sorted(missing)}")
     if unexpected:
-        logging.warning(f"Unexpected keys when loading DiT: {unexpected}")
+        logging.warning(f"Unexpected keys when loading DiT: "
+                        f"{sorted(unexpected)}")
     return model.to(dtype=torch_dtype)
 
 
