@@ -484,12 +484,20 @@ class T5EncoderModel:
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 
-        # init model
-        model = umt5_xxl(
-            encoder_only=True,
-            return_tokenizer=False,
-            dtype=dtype,
-            device=device).eval().requires_grad_(False)
+        # init model — build directly in the target dtype. _t5() creates
+        # parameters under torch's default dtype (fp32) and only converts
+        # afterwards, so an unwrapped umt5-xxl build peaks ~22.7 GB in RAM
+        # before the .to(dtype) ever runs.
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(dtype)
+            model = umt5_xxl(
+                encoder_only=True,
+                return_tokenizer=False,
+                dtype=dtype,
+                device=device).eval().requires_grad_(False)
+        finally:
+            torch.set_default_dtype(old_dtype)
         logging.info(f'loading {checkpoint_path}')
         # mmap keeps the 11.36 GB bf16 state dict file-backed instead of
         # anonymous RAM; without it the load peaks ~24 GB beside the model
