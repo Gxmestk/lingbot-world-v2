@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -467,6 +468,82 @@ def umt5_xxl(**kwargs):
     return _t5('umt5-xxl', **cfg)
 
 
+def _drop_file_cache(path):
+    """Ask the kernel to evict this file's clean page-cache pages.
+
+    Weight files are read once per process; leaving them cached (11.36 GB
+    for umt5-xxl) counts toward the container's memory ceiling and trips
+    external watchdogs, while saving nothing — there is no second read.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+_SAFETENSORS_DTYPES = {
+    'BF16': torch.bfloat16, 'F16': torch.float16, 'F32': torch.float32,
+    'F64': torch.float64, 'I64': torch.int64, 'I32': torch.int32,
+    'I16': torch.int16, 'I8': torch.int8, 'U8': torch.uint8,
+    'BOOL': torch.bool,
+}
+
+
+def _load_state_dict_streaming(model, path):
+    """Load a safetensors checkpoint into ``model`` with flat peak memory.
+
+    torch.load(mmap=True) keeps one mapping over the whole file for the
+    lifetime of the returned state dict, so beside a bf16 umt5-xxl build
+    the load rides at model + file (~25 GiB) — over tight container
+    ceilings. Reading each tensor with pread instead leaves the file's
+    pages unmapped, so each range's cache drops as soon as the tensor is
+    copied: peak = model + one tensor (~2 GiB for the embedding).
+    """
+    import json
+    import struct
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        (header_len,) = struct.unpack('<Q', os.pread(fd, 8, 0))
+        header = json.loads(os.pread(fd, header_len, 8))
+        header.pop('__metadata__', None)
+        base = 8 + header_len
+        model_sd = model.state_dict()
+        missing = set(model_sd) - set(header)
+        unexpected = set(header) - set(model_sd)
+        if missing or unexpected:
+            raise RuntimeError(
+                f'Error(s) in loading state dict for {type(model).__name__}: '
+                f'missing keys {sorted(missing)}, '
+                f'unexpected keys {sorted(unexpected)}')
+        with torch.no_grad():
+            for name, info in header.items():
+                start, end = info['data_offsets']
+                want = end - start
+                buf = bytearray(want)
+                off = 0
+                while off < want:          # pread may return short reads
+                    r = os.pread(fd, min(want - off, 1 << 30),
+                                 base + start + off)
+                    if not r:
+                        raise RuntimeError(f'short read on {name}')
+                    buf[off:off + len(r)] = r
+                    off += len(r)
+                dst = model_sd[name]
+                t = torch.frombuffer(
+                    buf, dtype=_SAFETENSORS_DTYPES[info['dtype']])
+                dst.copy_(t.reshape(dst.shape))
+                del t, buf
+                os.posix_fadvise(
+                    fd, base + start, want, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
 class T5EncoderModel:
 
     def __init__(
@@ -499,11 +576,18 @@ class T5EncoderModel:
         finally:
             torch.set_default_dtype(old_dtype)
         logging.info(f'loading {checkpoint_path}')
-        # mmap keeps the 11.36 GB bf16 state dict file-backed instead of
-        # anonymous RAM; without it the load peaks ~24 GB beside the model
-        # and dies on boxes without swap.
-        model.load_state_dict(torch.load(
-            checkpoint_path, map_location='cpu', mmap=True))
+        # Prefer a converted .safetensors sibling: it streams flat (see
+        # _load_state_dict_streaming). The mmap fallback below still
+        # peaks at model + whole file — only safe with ample headroom.
+        st_path = os.path.splitext(checkpoint_path)[0] + '.safetensors'
+        if os.path.isfile(st_path):
+            _load_state_dict_streaming(model, st_path)
+        else:
+            model.load_state_dict(torch.load(
+                checkpoint_path, map_location='cpu', mmap=True))
+            # the load copied everything; the mapping is gone, so evict
+            # the file's cache pages (they are read never again)
+            _drop_file_cache(checkpoint_path)
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)

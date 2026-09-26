@@ -69,14 +69,14 @@ def _resolve_dit_dir(checkpoint_dir, subfolder):
     return checkpoint_dir
 
 
-def _iter_safetensors_shards(dit_dir):
-    """Yield (name, state_dict) for each safetensors shard in ``dit_dir``.
+def _list_safetensors_shards(dit_dir):
+    """Return the safetensors shard filenames in ``dit_dir``, in order.
 
-    One shard at a time so the caller's peak RAM stays bounded by the
-    largest shard instead of the merged dump.
+    Names only — loading happens in the caller's loop so each shard's
+    zero-copy mapping can be released and its cache dropped before the
+    next shard is read (a generator would keep the state dict
+    referenced while suspended, pinning the mapped pages).
     """
-    from safetensors.torch import load_file
-
     for index_name in (
             "model.safetensors.index.json",
             "diffusion_pytorch_model.safetensors.index.json",
@@ -86,23 +86,37 @@ def _iter_safetensors_shards(dit_dir):
             continue
         with open(index_path) as f:
             index = json.load(f)
-        for shard in sorted(set(index["weight_map"].values())):
-            yield shard, load_file(os.path.join(dit_dir, shard))
-        return
+        return sorted(set(index["weight_map"].values()))
 
     for single_name in (
             "model.safetensors",
             "diffusion_pytorch_model.safetensors",
     ):
-        single_path = os.path.join(dit_dir, single_name)
-        if os.path.isfile(single_path):
-            yield single_name, load_file(single_path)
-            return
+        if os.path.isfile(os.path.join(dit_dir, single_name)):
+            return [single_name]
 
     raise FileNotFoundError(
         f"No safetensors weights found in {dit_dir}. Expected a sharded "
         "index (model.safetensors.index.json) or a single model.safetensors."
     )
+
+
+def _drop_file_cache(path):
+    """Ask the kernel to evict this file's clean page-cache pages.
+
+    Weight shards are read once per process; leaving them cached (6.84 GB
+    for the 1.3B DiT) counts toward the container's memory ceiling and
+    trips external watchdogs, while saving nothing — there is no second
+    read.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _dit_kwargs_from_config(config, extra=None):
@@ -156,12 +170,19 @@ def load_dit_model(model_cls, checkpoint_dir, subfolder, config, torch_dtype,
     finally:
         torch.set_default_dtype(old_dtype)
     missing, unexpected = None, set()
-    for _shard, shard_state in _iter_safetensors_shards(dit_dir):
+    from safetensors.torch import load_file
+    for shard in _list_safetensors_shards(dit_dir):
+        shard_path = os.path.join(dit_dir, shard)
+        shard_state = load_file(shard_path)
         shard_missing, shard_unexpected = model.load_state_dict(
             shard_state, strict=False)
         missing = (set(shard_missing) if missing is None
                    else missing & set(shard_missing))
         unexpected |= set(shard_unexpected)
+        # load_file returns zero-copy mapped tensors; fadvise cannot evict
+        # pages that are still mapped, so release the mapping first
+        del shard_state
+        _drop_file_cache(shard_path)
     if missing:
         logging.warning(f"Missing keys when loading DiT: {sorted(missing)}")
     if unexpected:
