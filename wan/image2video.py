@@ -765,14 +765,19 @@ class WanI2VCausal:
             wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
             c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
 
+        # Build the context video on the GPU. The CPU route (zeros + concat +
+        # pageable H2D copy) costs ~3 GiB of host RAM at 269 frames — invisible
+        # at the 81-frame smoke length, but it pushed cgroup current past the
+        # 22 GiB guard before the first chunk. Only the interpolated first
+        # frame (~4.6 MB) needs to cross the bus; vae.encode temporally chunks
+        # internally (4-frame windows), so VRAM stays flat.
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
                     img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
+                        0, 1).to(self.device),
+                torch.zeros(3, F - 1, h, w, device=self.device)
+            ], dim=1)
         ])[0]
         y = torch.concat([msk, y])
 
