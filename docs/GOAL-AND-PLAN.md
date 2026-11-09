@@ -2,55 +2,126 @@
 
 **Status: living document.** The goal and plan are decisions so far, not
 promises — they may change as we learn. Update this file whenever they do.
-Date written: 2026-11-07.
+Written: 2026-11-07. Restructured: 2026-11-08 (finish lingbot's own
+interaction surface first, physics second; stay on 1.3B).
+Updated: 2026-11-09 (Phase B rescope — RealWonder replication already done;
+settled-conclusions section added; action.npy open question).
 
 ---
 
 ## Goal
 
-Make lingbot-world-v2 accept scripted events **during a run** (mid-stream),
-the way RealWonder drives its scenes:
+Recreate the paper's interactive features (arXiv 2607.07534) on
+**lingbot-world-v2-1.3b-causal-fast, 1 GPU** — the features the released
+weights actually support, at batch speed — then add RealWonder-style physics
+on top.
 
-- Premade text events that change the scene at a chosen chunk
-- Premade camera/action events
-- Later (maybe): physics/force events via the RealWonder sim stage
+**Not in scope:** 14B models (need ~8 GPUs), real-time 60 fps serving
+(not released), full agentic harness (not released — optional stretch later).
 
-Chosen first target: **combo 3** — one image + launch text, then premade
-text events fire mid-run. Live (real-time) variants are parked: ~1.1 s/frame
-on the 1.3B GPU → ~18 s per 16-frame chunk → ~0.9 fps, far below 24 fps.
+### Paper feature vs release status (checked 2026-11-08)
 
-## Why this shape
-
-lingbot's model only has 3 receivers: text, camera/action tensors, past
-frames. No object/physics receiver. So:
-
-| event type | receiver exists? | effort |
+| paper feature | released? | fact |
 |---|---|---|
-| text | yes (`wan/image2video.py:706-718`, cross-attn rebuild `:673-675`) | small — re-encode + rebuild cache ~1–2 s |
-| camera/action | yes (`poses.npy`, `wasd_action.npy`) | small — generate the arrays |
-| force/physics | **no** | big — needs RealWonder stage: SAM2 → SAM-3D → Genesis → SDEdit injection (inference-time only, no fine-tune) |
+| causal chunked generation | ✅ | replicated: 269 frames, 9m41s |
+| camera (poses+intrinsics) | ✅ wired | `wan/image2video.py:647,720` |
+| WASD movement | ✅ wired | `:756-766`, 4-dim per-frame channel fused into plucker |
+| mid-run text events | ⚠️ model yes, code no | batch script: one prompt only |
+| attack/archery/spell/shoot actions | ⚠️ data yes, code no | `examples/03/action.npy` is (961,4) binary flags; **no released code reads `action.npy`** |
+| real-time 60 fps | ❌ | not released (SGLang/flashdreams pointers only) |
+| agentic harness | ❌ | paper concept only |
 
-## Plan (order matters)
+## Plan
 
-1. **Text-event runner** — `generate_events.py` taking
-   `[{when: chunk_idx, text: "..."}]`; before each chunk, if an event fires,
-   T5 re-encode + cross-attn K/V rebuild + drop self-attn cache so the new
-   text enters cleanly. (~2–4 s extra per event.)
-2. **Test run** — lake scene (`examples/03`), 269 frames, events at chunk 4
-   and 9. Check: scene actually changes? quality stable after switch?
-3. **Camera/action scripting** — generate pose/action arrays for the same
-   event format. Low effort.
-4. **Force path decision** — only after 1–3. Key unknowns
-   (see `lingbot-realwonder-notes.md` §10):
-   (a) does lingbot causal_fast obey SDEdit-injected sim frames?
-   (b) is ~18 s/chunk latency acceptable?
+### Phase A — finish lingbot's interaction surface (batch speed)
 
-Everything funnels through one core: a per-chunk event queue. Steps 1–3 use
-existing receivers; step 4 reuses the same injection loop the earlier steps
-validate.
+- **A1: mid-stream text events** — `generate_events.py` taking
+  `[{when: chunk_idx, text: "..."}]`; before each chunk, if an event fires:
+  T5 re-encode (~1–2 s) + cross-attn K/V rebuild (`image2video.py:673-675`)
+  + drop self-attn cache so the new text enters cleanly.
+- **A2: wire the action channel** — make the model accept `action.npy`
+  (attack/shoot-style 4-dim flags), mirroring the WASD path at
+  `:756-766`. Needs one experiment: does the DiT accept a second 4-dim
+  channel (or is WASD the only trained port)?
+  **Open question first:** `action.npy` has 961 rows but the video has 269
+  frames — the time mapping is unknown; resolve before wiring.
+- **A3: scripted camera/action generation** — procedurally generate
+  `poses.npy` / `wasd_action.npy` / `intrinsics.npy` from the same event
+  format (orbit, dolly, walk-forward, …).
+- **A-test**: lake scene (`examples/03`), 269 frames, one text event +
+  one action event. Check: scene changes visibly? quality stable after a
+  cache swap?
+
+### Phase B — physics via RealWonder (after A)
+
+**Already done by another agent (Oct 2026)** — verified in
+`../video-gen-physics/RealWonder/`: offline pipeline end-to-end on 3 author
+cases (lamp, persimmon, two_duck; final videos in `result/`), with 16 GB
+GPU / 28 GB RAM VM adaptations committed to the Gxmestk fork (`RUN_LOCAL.md`).
+**NOT done there:** novel (non-author) scenes, live demo, tree/santa_cloth/
+sand_house runs. RealWonder replication status is therefore:
+"batch path on author-configured scenes ✅; setup stage ❌ never exercised;
+live loop ❌ never run".
+
+Remaining Phase B work:
+- **B1: exercise the setup stage on one of our own images** — first-ever
+  attempt here (fresh photo → clicks → masks → config); measures the real
+  "10–30 min hand-setup" number. Independent of Phase A — can run in
+  parallel if we choose.
+- **B2: SDEdit-into-lingbot obedience test (unknown (a))** — the replication
+  used RealWonder's own distilled model, so lingbot obedience is still
+  untested. Key experiment unchanged (notes §10): warp lingbot's first frame
+  along a hand-made trajectory, SDEdit-inject into ONE lingbot chunk
+  (denoise 300→100), compare obedience vs no injection.
+- **B3: live force loop** — RealWonder's released demo receives **forces
+  only** live (`demo_web/app.py` handlers; camera/robot are paper-level
+  only). Decide: RealWonder demo path vs lingbot-injection path; reuses A's
+  event queue.
+
+### Core idea both phases share
+
+One event queue keyed by chunk index:
+`Event = { when: chunk_idx, type: text|camera|wasd|action|force, data }`.
+Phase A fills receivers that already exist; Phase B adds the force receiver.
+
+## Settled conclusions & rejected ideas (2026-11-09 Q&A session)
+
+Do not re-propose these without new evidence:
+
+- **RealWonder is NOT a world model.** It is a classical physics simulator
+  (Genesis: hand-coded dynamics, explicit 3D state) + a generative video
+  model used as a realistic renderer (SDEdit photorealization). Its own
+  paper motivates this by saying world models "lack architectural components
+  to process such actions directly" (realwonder.txt:144). Lingbot, by
+  contrast, is a world model: dynamics learned in the weights, no explicit
+  state/objects.
+- **Neither system covers arbitrary events.** Lingbot text events are
+  bounded by training-data distribution (global/qualitative changes OK;
+  precise quantities, exact timing, object-specific targeting are not).
+  RealWonder is bounded by the sim-engine catalog + reconstruction quality
+  (rigid/cloth/granular only, approximate contact, hand-set params with VLM
+  appearance-prior guesses that users override — paper :272-278).
+- **REJECTED: motion-fitting (candidate 1) and lingbot-as-probe-generator
+  (candidate 2) in the single-image setting.** Both are circular: fitting
+  sim parameters against model-generated motion measures the model's
+  beliefs, not real physics ("cannot distinguish 'the fruit is soft' from
+  'the model imagines soft'"). Evidence that video models' physical
+  commonsense is weak: best T2V models score only ~39.6% (VideoPhy) and
+  ~22% (VideoPhy-2, ICLR 2026) joint semantic+physical adherence vs humans;
+  top models there include Wan 2.1-14B — lingbot's parent family — and our
+  1.3B causal-fast is a lower-fidelity distilled tier of it.
+- **If that novelty is ever wanted**, the honest setting is: **real input
+  clip → fitted params → interactive world** (a video-input product —
+  different from RealWonder's single-image one). Otherwise we are an honest
+  replication/integration project, which is already valuable.
+- **Vocabulary to keep straight:** lingbot `poses.npy` = scene-agnostic
+  camera data ≠ RealWonder event scripts = scene-specific knowledge.
+  "Hand-tuned" RealWonder cases = staged inputs + automation gaps, not
+  cheating.
 
 ## Related docs
 
-- `docs/lingbot-realwonder-notes.md` — full discussion notes, verified
-  file:line facts, RealWonder analysis, feasibility unknowns.
-- `docs/RUNBOOK-1.3B-causal-fast.md` — how to run the 1.3B model here.
+- `docs/lingbot-realwonder-notes.md` — discussion notes, verified
+  file:line facts, RealWonder analysis.
+- `RUNBOOK-1.3B-causal-fast.md` — how to run the 1.3B model here.
+- `../video-gen-physics/RealWonder/RUN_LOCAL.md` — how RealWonder runs here.
